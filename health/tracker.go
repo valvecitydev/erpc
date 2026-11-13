@@ -1622,11 +1622,13 @@ func (t *Tracker) GetNetworkMethodMetrics(network, method string) *TrackedMetric
 // --------------------------------------------
 
 // updateNetworkLagMetrics updates lag metrics for all upstreams in a network
-// This is a DRY helper to avoid code duplication between SetLatestBlockNumber and SetFinalizedBlockNumber
+// This is a DRY helper to avoid code duplication between SetLatestBlockNumber and SetFinalizedBlockNumber.
+// getUpstreamValue returns false when the upstream has no value to measure lag
+// from; its lag is then left as it is.
 func (t *Tracker) updateNetworkLagMetrics(
 	net string,
 	networkValue int64,
-	getUpstreamValue func(common.Upstream, *NetworkMetadata) int64,
+	getUpstreamValue func(common.Upstream, *NetworkMetadata) (int64, bool),
 	setLag func(*TrackedMetrics, int64),
 	getGauge func(string, string, string, string) prometheus.Gauge,
 	lg *zerolog.Logger,
@@ -1648,8 +1650,8 @@ func (t *Tracker) updateNetworkLagMetrics(
 			}
 			tm := value.(*TrackedMetrics)
 			upsMeta := t.getMetadata(metadataKey{k.ups, net})
-			upsValue := getUpstreamValue(k.ups, upsMeta)
-			if upsValue <= 0 {
+			upsValue, ok := getUpstreamValue(k.ups, upsMeta)
+			if !ok {
 				lg.Debug().Str("networkId", net).
 					Str("upstreamId", k.ups.Id()).
 					Int64("value", upsValue).
@@ -1675,8 +1677,8 @@ func (t *Tracker) updateNetworkLagMetrics(
 			if v, ok := t.upsMetrics.Load(k); ok {
 				tm := v.(*TrackedMetrics)
 				upsMeta := t.getMetadata(metadataKey{k.ups, net})
-				upsValue := getUpstreamValue(k.ups, upsMeta)
-				if upsValue <= 0 {
+				upsValue, ok := getUpstreamValue(k.ups, upsMeta)
+				if !ok {
 					lg.Debug().Str("networkId", net).
 						Str("upstreamId", k.ups.Id()).
 						Int64("value", upsValue).
@@ -2629,10 +2631,14 @@ func (t *Tracker) setLatestBlockNumber(upstream common.Upstream, blockNumber int
 	// 4) Update the TrackedMetrics.BlockHeadLag fields for Upstream(s)
 	if needsGlobalUpdate || membershipChanged {
 		// Recompute for every upstream in the network
+		// An upstream with no head (never polled, or stuck at block 0) is
+		// measured from block 0, so it lags by the whole network head. Read
+		// as 0 lag, it would pass every lag gate. At cold start there is no
+		// network head and nothing reaches this point.
 		t.updateNetworkLagMetrics(
 			net,
 			ntwBn,
-			lagHead,
+			func(ups common.Upstream, meta *NetworkMetadata) (int64, bool) { return lagHead(ups, meta), true },
 			func(tm *TrackedMetrics, lag int64) { tm.BlockHeadLag.Store(lag) },
 			t.getHeadLagGauge,
 			lg,
@@ -2955,12 +2961,15 @@ func (t *Tracker) rederiveNetworkFinalized(ntwMeta *NetworkMetadata, net, netLab
 	t.updateNetworkLagMetrics(
 		net,
 		ntwVal,
-		func(ups common.Upstream, meta *NetworkMetadata) int64 {
+		func(ups common.Upstream, meta *NetworkMetadata) (int64, bool) {
 			f := meta.evmFinalizedBlockNumber.Load()
-			if meta.headBenched.Load() {
-				return f
+			if f <= 0 {
+				return 0, false
 			}
-			return meta.finalizedReport.presumed(f, ntwVal, now, pollPeriod(ups, blockTime))
+			if meta.headBenched.Load() {
+				return f, true
+			}
+			return meta.finalizedReport.presumed(f, ntwVal, now, pollPeriod(ups, blockTime)), true
 		},
 		func(tm *TrackedMetrics, lag int64) { tm.FinalizationLag.Store(lag) },
 		t.getFinalizationLagGauge,
