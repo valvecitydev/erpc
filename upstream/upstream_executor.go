@@ -127,7 +127,7 @@ func (e *upstreamExecutor) Run(
 
 	switch req.UpstreamPolicies() {
 	case common.UpstreamPoliciesTimeoutOnly, common.UpstreamPoliciesHeadAsk:
-		resp, err := e.callWithTimeout(ctx, req, inner, false)
+		resp, _, err := e.callWithTimeout(ctx, req, inner, false)
 		return resp, e.wrapTimeout(err, startTime)
 	case common.UpstreamPoliciesTracker, common.UpstreamPoliciesTrackerFill:
 		// The network's tracker sweep skips upstreams whose breaker is open,
@@ -170,20 +170,26 @@ func (e *upstreamExecutor) wrapTimeout(err error, startTime time.Time) error {
 	return common.NewErrFailsafeTimeoutExceeded(common.ScopeUpstream, err, &startTime)
 }
 
+// callWithTimeout runs inner under this scope's attempt timeout.
+// timedOut reports that the attempt's own timer fired while the caller's
+// ctx was still live.
 func (e *upstreamExecutor) callWithTimeout(
 	ctx context.Context,
 	req *common.NormalizedRequest,
 	inner func(ctx context.Context, isHedge bool) (*common.NormalizedResponse, error),
 	isHedge bool,
-) (*common.NormalizedResponse, error) {
+) (resp *common.NormalizedResponse, timedOut bool, err error) {
 	if e.timeout != nil {
 		if td := e.timeout(ctx, req); td != nil {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeoutCause(ctx, *td, common.ErrDynamicTimeoutExceeded)
+			attemptCtx, cancel := context.WithTimeoutCause(ctx, *td, common.ErrDynamicTimeoutExceeded)
 			defer cancel()
+			resp, err = inner(attemptCtx, isHedge)
+			timedOut = ctx.Err() == nil && errors.Is(context.Cause(attemptCtx), common.ErrDynamicTimeoutExceeded)
+			return resp, timedOut, err
 		}
 	}
-	return inner(ctx, isHedge)
+	resp, err = inner(ctx, isHedge)
+	return resp, false, err
 }
 
 func (e *upstreamExecutor) runRetry(
@@ -374,10 +380,10 @@ func (e *upstreamExecutor) callBreakerWithTimeout(
 		}
 	}
 
-	resp, err := e.callWithTimeout(ctx, req, inner, isHedge)
+	resp, timedOut, err := e.callWithTimeout(ctx, req, inner, isHedge)
 
 	if e.breaker != nil && upstreamBreakerEligible(req, isHedge) {
-		e.breaker.Record(upstreamBreakerOutcome(ctx, resp, err))
+		e.breaker.Record(upstreamBreakerOutcome(resp, err, timedOut))
 	}
 	return resp, err
 }
@@ -400,12 +406,14 @@ func upstreamBreakerEligible(req *common.NormalizedRequest, isHedge bool) bool {
 // the breaker; transport / 5xx / sync-empty open the circuit; success
 // closes it.
 //
-// ctx is the caller's context for this attempt, without the attempt's own
-// timeout. An endpoint timeout while ctx is still live means the attempt's
-// own timeout fired: the endpoint accepted the request and did not answer.
-// An endpoint timeout after ctx is done means the caller's budget ran out,
-// which says nothing about this upstream.
-func upstreamBreakerOutcome(ctx context.Context, resp *common.NormalizedResponse, err error) failsafe.Outcome {
+// attemptTimedOut reports that this scope's own attempt timer fired while
+// the caller still waited: the endpoint accepted the request and did not
+// answer in time. Other endpoint timeouts stay ignored. When the caller's
+// budget ran out (client cancel, network deadline), it says nothing about
+// this upstream. When the node reports a timeout of its own (a JSON-RPC
+// "context deadline exceeded" or a gRPC DeadlineExceeded), the cause is
+// often the client's query, such as a huge eth_getLogs range.
+func upstreamBreakerOutcome(resp *common.NormalizedResponse, err error, attemptTimedOut bool) failsafe.Outcome {
 	if err != nil {
 		// Cancellations / capacity / known-soft errors are ignored.
 		if common.HasErrorCode(err, common.ErrCodeEndpointRequestCanceled) {
@@ -423,7 +431,7 @@ func upstreamBreakerOutcome(ctx context.Context, resp *common.NormalizedResponse
 		) {
 			return failsafe.OutcomeFailure
 		}
-		if common.HasErrorCode(err, common.ErrCodeEndpointRequestTimeout) && ctx.Err() == nil {
+		if attemptTimedOut && common.HasErrorCode(err, common.ErrCodeEndpointRequestTimeout) {
 			return failsafe.OutcomeFailure
 		}
 		return failsafe.OutcomeIgnore

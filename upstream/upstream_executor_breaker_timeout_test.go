@@ -182,3 +182,28 @@ func TestUpstreamExecutor_BreakerIgnoresLostHedge(t *testing.T) {
 	_, _, executions := ex.Breaker().Metrics()
 	require.Zero(t, executions)
 }
+
+// A node that times out its own call answers at once with a JSON-RPC error.
+// The client's query often causes that (a huge eth_getLogs range, a heavy
+// trace), so it does not count against the upstream.
+func TestUpstreamExecutor_BreakerIgnoresNodeReportedTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"context deadline exceeded"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := newBreakerTimeoutTestClient(t, u)
+	ex := newBreakerTimeoutTestExecutor(t, 5*time.Second, 1, nil)
+
+	req := breakerTimeoutTestRequest()
+	_, err = ex.Run(context.Background(), req, func(ctx context.Context, _ bool) (*common.NormalizedResponse, error) {
+		return client.SendRequest(ctx, req)
+	})
+	require.Error(t, err)
+	require.True(t, common.HasErrorCode(err, common.ErrCodeEndpointRequestTimeout), "%v", err)
+	require.Equal(t, failsafe.StateClosed, ex.Breaker().State())
+	_, _, executions := ex.Breaker().Metrics()
+	require.Zero(t, executions)
+}
