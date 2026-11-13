@@ -377,7 +377,7 @@ func (e *upstreamExecutor) callBreakerWithTimeout(
 	resp, err := e.callWithTimeout(ctx, req, inner, isHedge)
 
 	if e.breaker != nil && upstreamBreakerEligible(req, isHedge) {
-		e.breaker.Record(upstreamBreakerOutcome(resp, err))
+		e.breaker.Record(upstreamBreakerOutcome(ctx, resp, err))
 	}
 	return resp, err
 }
@@ -399,7 +399,13 @@ func upstreamBreakerEligible(req *common.NormalizedRequest, isHedge bool) bool {
 // breaker. Most ignorable errors return OutcomeIgnore so they don't move
 // the breaker; transport / 5xx / sync-empty open the circuit; success
 // closes it.
-func upstreamBreakerOutcome(resp *common.NormalizedResponse, err error) failsafe.Outcome {
+//
+// ctx is the caller's context for this attempt, without the attempt's own
+// timeout. An endpoint timeout while ctx is still live means the attempt's
+// own timeout fired: the endpoint accepted the request and did not answer.
+// An endpoint timeout after ctx is done means the caller's budget ran out,
+// which says nothing about this upstream.
+func upstreamBreakerOutcome(ctx context.Context, resp *common.NormalizedResponse, err error) failsafe.Outcome {
 	if err != nil {
 		// Cancellations / capacity / known-soft errors are ignored.
 		if common.HasErrorCode(err, common.ErrCodeEndpointRequestCanceled) {
@@ -415,6 +421,9 @@ func upstreamBreakerOutcome(resp *common.NormalizedResponse, err error) failsafe
 			common.ErrCodeEndpointUnauthorized,
 			common.ErrCodeEndpointBillingIssue,
 		) {
+			return failsafe.OutcomeFailure
+		}
+		if common.HasErrorCode(err, common.ErrCodeEndpointRequestTimeout) && ctx.Err() == nil {
 			return failsafe.OutcomeFailure
 		}
 		return failsafe.OutcomeIgnore
