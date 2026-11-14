@@ -187,24 +187,30 @@ func (e *networkExecutor) acceptsEmptyResult(method string, resp *common.Normali
 }
 
 func isEmptyTraceArray(resp *common.NormalizedResponse) bool {
+	result := resultBytes(resp)
+	return len(result) >= 2 && result[0] == '[' && result[len(result)-1] == ']' &&
+		len(bytes.Trim(result[1:len(result)-1], " \t\r\n")) == 0
+}
+
+// resultBytes returns resp's JSON-RPC result with surrounding whitespace
+// trimmed, or nil when resp has no readable result.
+func resultBytes(resp *common.NormalizedResponse) []byte {
 	if resp == nil {
-		return false
+		return nil
 	}
 	jrr, err := resp.JsonRpcResponse()
 	if err != nil || jrr == nil {
-		return false
+		return nil
 	}
 	result := jrr.GetResultBytes()
 	if len(result) == 0 {
 		var buf bytes.Buffer
 		if _, err := jrr.WriteResultTo(&buf, false); err != nil {
-			return false
+			return nil
 		}
 		result = buf.Bytes()
 	}
-	result = bytes.Trim(result, " \t\r\n")
-	return len(result) >= 2 && result[0] == '[' && result[len(result)-1] == ']' &&
-		len(bytes.Trim(result[1:len(result)-1], " \t\r\n")) == 0
+	return bytes.Trim(result, " \t\r\n")
 }
 
 func isEmptyNetworkResult(method string, resp *common.NormalizedResponse) bool {
