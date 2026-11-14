@@ -2588,6 +2588,10 @@ const DefaultEmptyResultMaxAttempts = 2
 // Methods deliberately EXCLUDED — for these, empty/null means "not found
 // yet, try another upstream": eth_getBlockByNumber, eth_getBlockByHash,
 // eth_getTransactionByHash, eth_getTransactionReceipt, eth_getBlockReceipts.
+//
+// The block counts (eth_getBlockTransactionCountBy*, eth_getUncleCountBy*)
+// are not on this list because their null means "unknown block". The network
+// executor accepts their "0x0" by shape instead, while this default is in use.
 func DefaultEmptyResultAccept() []string {
 	return []string{
 		// Filter / range queries — empty array is a valid "no matches".

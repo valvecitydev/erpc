@@ -766,3 +766,108 @@ func TestEmptyResultAcceptFollowedTraceBlock(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond, "an open resumable tap fills down to maxBackfill")
 	stopStream()
 }
+
+// TestEmptyResultAcceptBlockCounts covers the four block-scoped count
+// methods (#1168). A "0x0" count is a real answer — an empty block, or any
+// post-merge block's uncle count — so the first upstream's zero must end the
+// request. A null count means the upstream does not know the block, so the
+// request must still move on to the next upstream.
+func TestEmptyResultAcceptBlockCounts(t *testing.T) {
+	methods := []struct{ method, param string }{
+		{"eth_getBlockTransactionCountByNumber", `"0x10"`},
+		{"eth_getBlockTransactionCountByHash", `"0x` + strings.Repeat("11", 32) + `"`},
+		{"eth_getUncleCountByBlockNumber", `"0x10"`},
+		{"eth_getUncleCountByBlockHash", `"0x` + strings.Repeat("11", 32) + `"`},
+	}
+	cases := []struct {
+		name, first, want string
+		override          []string
+		calls             int32
+	}{
+		{name: "ZeroIsFinal", first: `"0x0"`, want: `"0x0"`, calls: 1},
+		{name: "NullRotates", first: `null`, want: `"0x2"`, calls: 2},
+		{name: "OverrideWithoutMethodRotates", first: `"0x0"`, want: `"0x2"`, override: []string{"eth_getLogs"}, calls: 2},
+	}
+	for _, m := range methods {
+		for _, tc := range cases {
+			for _, mode := range []string{"hedge", "retry"} {
+				if tc.override != nil && mode == "hedge" {
+					continue // the override lives on the retry policy
+				}
+				t.Run(m.method+"/"+tc.name+"/"+mode, func(t *testing.T) {
+					util.ResetGock()
+					t.Cleanup(util.ResetGock)
+					util.SetupMocksForEvmStatePoller()
+					var calls atomic.Int32
+					for i, host := range []string{"http://rpc1.localhost", "http://rpc2.localhost"} {
+						result := `"0x2"`
+						if i == 0 {
+							result = tc.first
+						}
+						gock.New(host).Post("").Filter(func(r *http.Request) bool {
+							return strings.Contains(util.SafeReadBody(r), m.method)
+						}).Persist().Reply(200).Map(func(r *http.Response) *http.Response {
+							calls.Add(1)
+							return r
+						}).BodyString(`{"jsonrpc":"2.0","id":1,"result":` + result + `}`)
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					var network *Network
+					if mode == "hedge" {
+						network = setupTestNetworkWithHedgePolicy(t, ctx, &common.HedgePolicyConfig{
+							Delay: common.NewStaticDuration(250 * time.Millisecond), MaxCount: 1,
+						})
+					} else {
+						network = setupTestNetworkWithRetryConfig(t, ctx,
+							&common.DirectiveDefaultsConfig{RetryEmpty: util.BoolPtr(true)},
+							&common.RetryPolicyConfig{
+								MaxAttempts:       3,
+								EmptyResultDelay:  common.Duration(250 * time.Millisecond),
+								EmptyResultAccept: tc.override,
+							},
+						)
+					}
+					network.PinUpstreamOrderForTest("rpc1", "rpc2")
+					req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + m.method + `","params":[` + m.param + `]}`))
+					req.ApplyDirectiveDefaults(network.cfg.DirectiveDefaults)
+					resp, err := network.Forward(ctx, req)
+					require.NoError(t, err)
+					require.NotNil(t, resp)
+					defer resp.Release()
+					jrr, err := resp.JsonRpcResponse()
+					require.NoError(t, err)
+					assert.Equal(t, tc.want, jrr.GetResultString())
+					assert.Equal(t, tc.calls, calls.Load())
+				})
+			}
+		}
+	}
+}
+
+func TestIsZeroQuantity(t *testing.T) {
+	for _, tc := range []struct {
+		result string
+		want   bool
+	}{
+		{`"0x0"`, true},
+		{`"0x00"`, true},
+		{` "0x0" `, true},
+		{`"0x1"`, false},
+		{`"0x10"`, false},
+		{`"0x"`, false},
+		{`"0x0`, false},
+		{`0x0`, false},
+		{`null`, false},
+		{`[]`, false},
+	} {
+		resp := common.NewNormalizedResponse().
+			WithJsonRpcResponse(common.MustNewJsonRpcResponseFromBytes([]byte(`1`), []byte(tc.result), nil))
+		if got := isZeroQuantity(resp); got != tc.want {
+			t.Errorf("isZeroQuantity(%s) = %v, want %v", tc.result, got, tc.want)
+		}
+	}
+	if isZeroQuantity(nil) {
+		t.Error("isZeroQuantity(nil) = true, want false")
+	}
+}

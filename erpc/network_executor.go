@@ -182,6 +182,14 @@ func (e *networkExecutor) acceptsEmptyResult(method string, resp *common.Normali
 	switch method {
 	case "debug_traceBlockByNumber":
 		return isEmptyTraceArray(resp) && evm.HasVerifiedEmptyTraceBlock(resp.Request())
+	case "eth_getBlockTransactionCountByHash",
+		"eth_getBlockTransactionCountByNumber",
+		"eth_getUncleCountByBlockHash",
+		"eth_getUncleCountByBlockNumber":
+		// A zero count is a real answer: an empty block, or any post-merge
+		// block's uncles. A null count means the upstream does not know the
+		// block, so the request still moves on to the next upstream.
+		return isZeroQuantity(resp)
 	}
 	return false
 }
@@ -211,6 +219,17 @@ func resultBytes(resp *common.NormalizedResponse) []byte {
 		result = buf.Bytes()
 	}
 	return bytes.Trim(result, " \t\r\n")
+}
+
+// isZeroQuantity reports whether resp's result is a JSON string holding a
+// hex quantity of value zero: "0x0", or "0x" followed by more zeros.
+func isZeroQuantity(resp *common.NormalizedResponse) bool {
+	result := resultBytes(resp)
+	if len(result) < len(`"0x0"`) || result[len(result)-1] != '"' || !bytes.HasPrefix(result, []byte(`"0x`)) {
+		return false
+	}
+	digits := result[len(`"0x`) : len(result)-1]
+	return len(bytes.TrimLeft(digits, "0")) == 0
 }
 
 func isEmptyNetworkResult(method string, resp *common.NormalizedResponse) bool {
