@@ -175,11 +175,15 @@ func (e *networkExecutor) acceptsEmptyResult(method string, resp *common.Normali
 	if slices.Contains(e.EmptyResultAccept(), method) {
 		return true
 	}
-	if method != "debug_traceBlockByNumber" ||
-		(e != nil && e.cfg != nil && e.cfg.Retry != nil && e.cfg.Retry.EmptyResultAccept != nil) {
+	// An explicit emptyResultAccept replaces the shape rules below.
+	if e != nil && e.cfg != nil && e.cfg.Retry != nil && e.cfg.Retry.EmptyResultAccept != nil {
 		return false
 	}
-	return isEmptyTraceArray(resp) && evm.HasVerifiedEmptyTraceBlock(resp.Request())
+	switch method {
+	case "debug_traceBlockByNumber":
+		return isEmptyTraceArray(resp) && evm.HasVerifiedEmptyTraceBlock(resp.Request())
+	}
+	return false
 }
 
 func isEmptyTraceArray(resp *common.NormalizedResponse) bool {
